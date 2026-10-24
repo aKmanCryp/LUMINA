@@ -153,18 +153,57 @@ function translateAuthError(msg: string): string {
   const m = msg.toLowerCase();
   if (m.includes('invalid login')) return 'Correo o contraseña incorrectos.';
   if (m.includes('already registered') || m.includes('already been registered'))
-    return 'Ya existe una cuenta con ese correo.';
+    // Neutral wording on purpose: confirming that an address has an account would let
+    // anyone test a list of emails through this form and build a customer list.
+    return 'No pudimos crear la cuenta con esos datos. Si ya tenés una cuenta, ingresá desde el formulario de inicio de sesión o recuperá tu contraseña.';
   if (m.includes('password')) return 'La contraseña debe tener al menos 6 caracteres.';
   if (m.includes('email')) return 'Ingresá un correo válido.';
   if (m.includes('rate limit')) return 'Demasiados intentos. Aguardá un momento.';
   return 'No pudimos completar la solicitud.';
 }
 
+// The database raises its own Spanish, user-facing messages for every rule the app
+// enforces. Anything else (constraint names, permission denials, PostgREST internals)
+// is internal detail and must not reach the screen.
+const APP_ERROR_MARKERS = [
+  'Solo un administrador',
+  'iniciar sesión',
+  'Producto no disponible',
+  'Revisá el formulario',
+  'Ingresá un nombre válido',
+  'Seleccioná una temática',
+  'Aceptá los términos',
+  'Completá los datos de la segunda persona',
+  'El código de referido',
+  'No se encontró este pedido',
+  'Este pedido ya no acepta avisos',
+  'Ingresá el nombre de quien transfirió',
+  'Ingresá el número de referencia',
+  'Esta referencia ya fue',
+  'Pedido no encontrado',
+  'Este pedido ya estaba aprobado',
+  'Este pedido ya fue aprobado',
+  'Este pedido no está pendiente',
+  'No hay un aviso de pago',
+  'El monto verificado no coincide',
+  'La referencia no coincide',
+  'No tenés un pedido pendiente',
+  'El espacio debe ser',
+  'Plan no válido',
+  'El vencimiento no puede superar',
+  'El QR ya está vencido',
+  'La imagen del QR no es válida',
+  'La imagen del QR es demasiado grande',
+  'No hay un QR',
+];
+
 function rpcError(error: { message: string }): Error {
-  const m = error.message;
+  const m = error.message ?? '';
   if (m.includes('Solo un administrador')) return new Error('Necesitás permisos de administrador.');
   if (m.includes('iniciar sesión')) return new Error('Necesitás iniciar sesión para continuar.');
-  return new Error(m);
+  if (APP_ERROR_MARKERS.some((marker) => m.includes(marker))) return new Error(m);
+  console.error('[lumina] error interno:', m);
+  return new Error('No pudimos completar la operación. Intentá de nuevo en un momento.');
 }
 
 export async function request(path: string, body?: unknown, _key?: string): Promise<any> {
