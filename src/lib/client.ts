@@ -77,15 +77,17 @@ export async function getMe(): Promise<Me | null> {
 }
 
 export async function signUp(email: string, password: string, displayName: string): Promise<void> {
-  const { data, error } = await supabase.auth.signUp({ email, password });
+  const { data, error } = await supabase.auth.signUp({
+    email,
+    password,
+    options: { data: { display_name: displayName.trim() || undefined } },
+  });
   if (error) throw new Error(translateAuthError(error.message));
-  if (data.user) {
-    await supabase.from('profiles').upsert({
-      id: data.user.id,
-      email,
-      display_name: displayName.trim() || null,
-      is_admin: false,
-    });
+  // The database trigger create_profile_on_signup() creates the profile row
+  // automatically. If email confirmation is enabled, the user must confirm
+  // before they can sign in.
+  if (data.user && data.session === null) {
+    throw new Error('Te enviamos un correo de confirmación. Revisá tu bandeja antes de ingresar.');
   }
 }
 
@@ -147,14 +149,8 @@ export async function request(path: string, body?: unknown, key?: string): Promi
     const { data, error } = await supabase
       .from('orders')
       .insert({
-        user_id: session.user.id,
         product: input.product,
-        amount: product.price,
-        discount: 0,
         payload: input as unknown as Record<string, unknown>,
-        payment_status: 'pending',
-        delivery_status: 'pending',
-        mode: 'manual_qr',
       })
       .select('*')
       .single();
@@ -162,8 +158,8 @@ export async function request(path: string, body?: unknown, key?: string): Promi
     return toOrder(data as OrderRow);
   }
 
-  if (path.startsWith('orders/') && !path.includes('/')) {
-    const orderId = path.split('/')[1];
+  if (path.startsWith('orders/') && !path.includes('/', 'orders/'.length)) {
+    const orderId = path.slice('orders/'.length);
     const { data, error } = await supabase
       .from('orders')
       .select('*')
