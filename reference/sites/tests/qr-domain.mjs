@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import ts from 'typescript';
+// Keep the production import style; transpile a temporary copy for Node's test runner.
+const source=(await fs.readFile(new URL('../lib/qr.ts',import.meta.url),'utf8')).replace('"./domain"',JSON.stringify(new URL('../lib/domain.ts',import.meta.url).href));
+const module=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
+const {validateQr,isLiveQr,validatePaymentReport,transactionKey}=await import('data:text/javascript;base64,'+Buffer.from(module).toString('base64'));
+const at=Date.parse('2026-10-22T14:00:00Z');
+const png='data:image/png;base64,'+Buffer.from([137,80,78,71,13,10,26,10,...Array(40).fill(0)]).toString('base64');
+const good={slot:1,amount:19000,holder:'Titular de Prueba',label:'Mango',generatedAt:'2026-10-22T13:00:00Z',expiresAt:'2026-10-22T17:00:00Z',authorized:true,amountConfirmed:true,reusable:true,image:png};
+let checks=0;const ok=(fn)=>{fn();checks++;};
+ok(()=>assert.equal(validateQr(good,at).amount,19000));
+for(const bad of [{slot:4},{amount:19000.5},{holder:'<b>X</b>'},{authorized:false},{reusable:false},{amountConfirmed:false},{expiresAt:'2026-10-22T17:00:01Z'},{expiresAt:'2026-10-22T14:00:00Z'},{generatedAt:'2026-10-22T15:00:00Z'},{image:'data:image/svg+xml;base64,AAAA'},{image:'data:image/jpeg;base64,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'}])ok(()=>assert.throws(()=>validateQr({...good,...bad},at)));
+const q={enabled:1,reusable:1,generated_at:good.generatedAt,expires_at:good.expiresAt};
+ok(()=>assert.equal(isLiveQr(q,at),true));
+ok(()=>assert.equal(isLiveQr(q,Date.parse(q.expires_at)),false));
+ok(()=>assert.equal(isLiveQr({...q,enabled:0},at),false));
+ok(()=>assert.equal(isLiveQr({...q,reusable:0},at),false));
+ok(()=>assert.throws(()=>validatePaymentReport({payer:'XX',reference:'1234'})));
+ok(()=>assert.equal(validatePaymentReport({payer:'Persona Demo',reference:'000123'}).reference,'000123'));
+ok(()=>assert.equal(transactionKey('Titular Demo','AB-123 456'),transactionKey('titular demo','ab123456')));
+ok(()=>assert.throws(()=>transactionKey('Demo','-')));
+console.log('PASS: '+checks+' QR validation and expiry checks');

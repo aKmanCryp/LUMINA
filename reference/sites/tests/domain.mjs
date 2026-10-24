@@ -1,0 +1,15 @@
+import assert from 'node:assert/strict';
+import {validBirth,signFor,validateOrder,dailyFor,SIGNS,dateKey,safeCsv} from '../lib/domain.ts';
+assert.equal(validBirth('2008-10-21','2026-10-21'),true);
+assert.equal(validBirth('2008-10-22','2026-10-21'),false);
+assert.equal(validBirth('2000-02-30','2026-10-21'),false);
+assert.equal(signFor('2000-01-01').id,'capricornio');
+assert.equal(signFor('2000-01-20').id,'acuario');
+assert.equal(signFor('2000-03-21').id,'aries');
+assert.equal(signFor('2000-12-22').id,'capricornio');
+assert.equal(dateKey(new Date('2026-10-22T01:30:00Z')),'2026-10-21');
+assert.equal(SIGNS.length,12);
+assert.deepEqual(dailyFor('libra','2026-10-21'),dailyFor('libra','2026-10-21'));
+assert.throws(()=>validateOrder({product:'unknown'}));
+assert.equal(safeCsv('=1+1'),'"\'=1+1"');
+console.log('PASS: 12 boundary/domain checks');

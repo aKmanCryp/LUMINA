@@ -1,0 +1,55 @@
+<!doctype html><html lang="es"><meta charset="utf-8"><title>LÚMINA · Prueba QR</title><style>body{font:14px/1.7 system-ui;padding:35px;background:#14252c;color:#eef2dd}button{padding:14px 22px}pre{white-space:pre-wrap}.pass{color:#d7ec9f}</style><h1>QR Mango · Pruebas locales con datos ficticios</h1><p>Se usan imágenes «TEST ONLY», sin códigos bancarios, sin pagos ni llamadas de IA.</p><button id="run">Ejecutar pruebas QR</button><pre id="out">Listo.</pre><script type="module">
+const out=document.querySelector('#out'),button=document.querySelector('#run');let checks=[];
+const uid=()=>Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join(''),base='qr-qa-'+uid().slice(0,7);
+async function api(path,data,user=null,key){const headers={};if(user){headers['oai-authenticated-user-id']=base+user;headers['oai-authenticated-user-email']=base+user+'@example.invalid';}if(data!==undefined)headers['Content-Type']='application/json';if(key)headers['Idempotency-Key']=key;const r=await fetch('/api/'+path,{headers,method:data===undefined?'GET':'POST',body:data===undefined?undefined:JSON.stringify(data)}),ct=r.headers.get('content-type')||'';return {s:r.status,d:ct.includes('json')?await r.json():await r.text()};}
+function check(n,b){if(!b)throw Error(n);checks.push(n);out.textContent=checks.map(n=>'OK '+n).join('\n');}
+const payload={product:'lectura',name:'Luna Demo',birth:'1998-10-10',theme:'general',adult:true,terms:true};
+async function create(user='a',product='lectura'){const r=await api('orders',{...payload,product,...(product==='compatibilidad'?{name2:'Sol Demo',birth2:'1996-07-30',otherConsent:true}:{})},user,uid());if(r.s!==201)throw Error('Crear pedido: '+r.s+' '+JSON.stringify(r.d));return r.d;}
+const canvas=document.createElement('canvas');canvas.width=240;canvas.height=240;const ctx=canvas.getContext('2d');ctx.fillStyle='white';ctx.fillRect(0,0,240,240);ctx.fillStyle='black';ctx.font='bold 24px sans-serif';ctx.fillText('TEST ONLY',46,110);ctx.font='15px sans-serif';ctx.fillText('NO REALIZAR PAGOS',27,142);const image=canvas.toDataURL('image/png');
+const q=(slot=1,amount=19000)=>({slot,amount,holder:'Titular Ficticio QA',label:'Mango · QA',generatedAt:new Date(Date.now()-60000).toISOString(),expiresAt:new Date(Date.now()+3*3600000).toISOString(),authorized:true,reusable:true,amountConfirmed:true,image});
+button.onclick=async()=>{button.disabled=true;checks=[];try{
+ check('Admin deniega identidad de cliente',(await api('admin/qr',undefined,'client')).s===403);
+ check('Cuarto espacio bloqueado',(await api('admin/qr',{...q(),slot:4})).s===400);
+ check('Vigencia mayor a 4 horas bloqueada',(await api('admin/qr',{...q(),expiresAt:new Date(Date.now()+5*3600000).toISOString()})).s===400);
+ check('Archivo SVG bloqueado',(await api('admin/qr',{...q(),image:'data:image/svg+xml;base64,AAAA'})).s===400);
+ check('QR de un solo uso bloqueado',(await api('admin/qr',{...q(),reusable:false})).s===400);
+ check('QR sin autorización bloqueado',(await api('admin/qr',{...q(),authorized:false})).s===400);
+ for(const [slot,amount]of [[1,19000],[2,29000],[3,49000]])check('Carga persistente espacio '+slot,(await api('admin/qr',q(slot,amount))).s===201);
+ const list=await api('admin/qr');check('Tres espacios vigentes',list.d.codes.filter(q=>q.active).length===3);
+ const order=await create(),id=order.id;
+ const qr=await api('orders/'+id+'/qr',{},'a');check('QR coincide con importe y titular',qr.s===200&&qr.d.qr.amount===19000&&qr.d.qr.holder==='Titular Ficticio QA');
+ check('Pedido etiquetado como prueba QR',(await api('orders/'+id,undefined,'a')).d.mode==='manual_qr_test');
+ check('Imagen persistida disponible',(await api('orders/'+id+'/qr-image',undefined,'a')).s===200);
+ check('Imagen ajena bloqueada',(await api('orders/'+id+'/qr-image',undefined,'b')).s===404);
+ check('Autopago simulado bloqueado tras elegir QR',(await api('demo/payments/'+id,{outcome:'approved'},'a')).s===403);
+ const noIntent=await create('b');check('Aviso sin abrir QR bloqueado',(await api('orders/'+noIntent.id+'/payment-report',{payer:'Persona Demo',reference:'TEST-000'},'b')).s===409);
+ check('Aviso de pago recibido',(await api('orders/'+id+'/payment-report',{payer:'Persona Demo',reference:'TEST-1111'},'a')).s===200);
+ check('Aviso no aprueba pago',(await api('orders/'+id,undefined,'a')).d.paymentStatus==='pending');
+ check('PDF permanece cerrado',(await api('orders/'+id+'/pdf',undefined,'a')).s===409);
+ check('Nuevo QR bloqueado durante revisión',(await api('orders/'+id+'/qr',{refresh:true},'a')).s===409);
+ check('Cliente no confirma ingreso',(await api('admin/manual-payment/'+id,{action:'approve',checked:true,amount:19000,reference:'TEST-1111'},'a')).s===403);
+ check('Importe discrepante bloqueado',(await api('admin/manual-payment/'+id,{action:'approve',checked:true,amount:1,reference:'TEST-1111'})).s===400);
+ check('Confirmación sin revisar bloqueada',(await api('admin/manual-payment/'+id,{action:'approve',checked:false,amount:19000,reference:'TEST-1111'})).s===400);
+ const approval={action:'approve',checked:true,amount:19000,reference:'TEST-1111'};await Promise.all([api('admin/manual-payment/'+id,approval),api('admin/manual-payment/'+id,approval)]);
+ const paid=(await api('orders/'+id,undefined,'a')).d;check('Confirmación concurrente entrega una sola vez',paid.paymentStatus==='paid'&&paid.deliveryStatus==='delivered'&&paid.attempts===1);
+ check('PDF disponible después de verificar',(await api('orders/'+id+'/pdf',undefined,'a')).s===200);
+ const second=await create('b');await api('orders/'+second.id+'/qr',{},'b');await api('orders/'+second.id+'/payment-report',{payer:'Persona Demo',reference:'TEST1111'},'b');
+ check('Referencia duplicada entre pedidos bloqueada',(await api('admin/manual-payment/'+second.id,{...approval,reference:'test 1111'})).s===409);
+ check('Segundo pedido sigue pendiente',(await api('orders/'+second.id,undefined,'b')).d.paymentStatus==='pending');
+ check('Devolver aviso para corregir',(await api('admin/manual-payment/'+second.id,{action:'reject',note:'Revisá la referencia. No encontramos ese movimiento.'})).s===200);
+ check('Cliente puede corregir aviso',(await api('orders/'+second.id+'/payment-report',{payer:'Persona Demo',reference:'TEST-2222'},'b')).s===200);
+ const c=await create('c','compatibilidad'),cqr=await api('orders/'+c.id+'/qr',{},'c');check('Compatibilidad selecciona QR 29000',cqr.d.qr.amount===29000);
+ check('Retirar QR',(await api('admin/qr/2/disable',{})).s===200);
+ check('Imagen retirada inaccesible',(await api('orders/'+c.id+'/qr-image',undefined,'c')).s===410);
+ check('Sin importe vigente no se muestra QR',(await api('orders/'+c.id+'/qr',{refresh:true},'c')).d.qr===null);
+ const changed={...q(2,29000),holder:'Otro Titular Ficticio'};check('Reemplazar espacio',(await api('admin/qr',changed)).s===201);
+ const refresh=await api('orders/'+c.id+'/qr',{refresh:true},'c');check('Renovación muestra nuevo titular',refresh.d.qr.holder==='Otro Titular Ficticio');
+ const d=await create('d');await api('orders/'+d.id+'/qr',{},'d');
+ const expired={...q(1,19000),generatedAt:new Date(Date.now()-3*3600000).toISOString(),expiresAt:new Date(Date.now()+1600).toISOString()};check('Carga QR cerca del vencimiento',(await api('admin/qr',expired)).s===201);await api('orders/'+d.id+'/qr',{refresh:true},'d');await new Promise(r=>setTimeout(r,1800));
+ check('Vencimiento bloqueado en servidor',(await api('orders/'+d.id+'/qr-image',undefined,'d')).s===410);
+ check('Checkout no reutiliza un código vencido',(await api('orders/'+d.id+'/qr',{refresh:true},'d')).d.qr===null);
+ const paymentReports=(await api('admin/payment-reports')).d;check('Comisiones QR registradas cero',paymentReports.reports.find(o=>o.order_id===id)?.fee_estimate===0);
+ for(const slot of [1,2,3])await api('admin/qr/'+slot+'/disable',{});
+ out.textContent+='\n\nPASS: '+checks.length+' verificaciones QR. '+base;out.className='pass';
+}catch(e){out.textContent+='\n\nFAIL: '+e.message;}finally{button.disabled=false;}};
+</script></html>
