@@ -1,0 +1,7 @@
+[functions.deliver-reading]
+verify_jwt = true
+entrypoint = "./functions/deliver-reading/index.ts"
+
+[functions.order-pdf]
+verify_jwt = true
+entrypoint = "./functions/order-pdf/index.ts"

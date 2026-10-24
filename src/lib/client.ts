@@ -64,6 +64,8 @@ export type AdminDashboard = {
   orders: any[];
   pending: number;
   delivered: number;
+  gen_errors?: number;
+  ai_cost?: number;
 };
 
 function toOrder(row: OrderRow): Order {
@@ -104,6 +106,45 @@ function referralCode(id: string): string {
   let h = 2166136261;
   for (let i = 0; i < id.length; i++) h = Math.imul(h ^ id.charCodeAt(i), 16777619);
   return (h >>> 0).toString(36).toUpperCase().padEnd(8, '0').slice(0, 8);
+}
+
+// Trigger the deliver-reading edge function to generate a reading.
+// Fire-and-forget: the edge function claims the lease and works asynchronously.
+async function triggerDelivery(orderId: string): Promise<void> {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session?.access_token) return;
+  const fnUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/deliver-reading`;
+  const resp = await fetch(fnUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${session.access_token}`,
+      apikey: import.meta.env.VITE_SUPABASE_ANON_KEY!,
+    },
+    body: JSON.stringify({ order_id: orderId }),
+  });
+  if (!resp.ok) {
+    console.error('[lumina] deliver-reading responded', resp.status);
+  }
+}
+
+// Download the PDF for a delivered order via authenticated fetch.
+// The edge function verifies JWT ownership; knowing the URL alone is not enough.
+export async function downloadPdf(orderId: string): Promise<Blob> {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session?.access_token) throw new Error('Necesitás iniciar sesión para descargar el PDF.');
+  const fnUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/order-pdf/${orderId}`;
+  const resp = await fetch(fnUrl, {
+    headers: {
+      Authorization: `Bearer ${session.access_token}`,
+      apikey: import.meta.env.VITE_SUPABASE_ANON_KEY!,
+    },
+  });
+  if (!resp.ok) {
+    const body = await resp.json().catch(() => ({}));
+    throw new Error(body.error || 'No pudimos generar el PDF.');
+  }
+  return resp.blob();
 }
 
 export async function getMe(): Promise<Me | null> {
@@ -320,8 +361,10 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
       orders: (data as AdminDashboard).orders,
       pending: (data as AdminDashboard).pending,
       delivered: (data as AdminDashboard).delivered,
+      genErrors: (data as AdminDashboard).gen_errors || 0,
+      aiCost: (data as AdminDashboard).ai_cost || 0,
       todaySales: 0, todayRevenue: 0, monthRevenue: 0, netBeforeTax: 0,
-      monthGross: 0, refunds: 0, fees: 0, aiCost: 0, adSpend: 0, fixedCosts: 0,
+      monthGross: 0, refunds: 0, fees: 0, adSpend: 0, fixedCosts: 0,
       vatReserve: 0, series: [], month: '', products: [], recurringCustomers: 0,
       referrals: 0, discounts: 0, cac: null, errors: [],
     };
@@ -359,7 +402,7 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
     return data;
   }
 
-  // Admin: approve order
+  // Admin: approve order (triggers generation via edge function)
   if (path.startsWith('admin/manual-payment/') && body !== undefined) {
     const orderId = path.split('/')[2];
     const b = body as { action: string; reference: string; amount: number };
@@ -370,6 +413,10 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
         p_verified_amount: b.amount,
       });
       if (error) throw rpcError(error);
+      // If the RPC started a generation lease, trigger the edge function
+      if (data?.generate_order_id) {
+        triggerDelivery(data.generate_order_id).catch((e) => console.error('[lumina] delivery trigger failed:', e));
+      }
       return data;
     }
     // reject
@@ -388,8 +435,41 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
     return { reports: (data as AdminDashboard).notices };
   }
 
-  // Blocked: demo payments, retries, PDF, IA
-  if (path.startsWith('demo/') || path.includes('/retry') || path.includes('/pdf')) {
+  // Retry generation for a paid order that failed or is stuck
+  if (path.includes('/retry') && path.startsWith('orders/') && body !== undefined) {
+    const orderId = path.split('/')[1];
+    // Verify ownership and status
+    const { data: order, error: orderErr } = await supabase
+      .from('orders')
+      .select('id, payment_status, delivery_status, attempts')
+      .eq('id', orderId)
+      .eq('user_id', session.user.id)
+      .maybeSingle();
+    if (orderErr || !order) throw new Error('No se encontró este pedido o no tenés acceso.');
+    if ((order as any).payment_status !== 'paid') throw new Error('El pago no está aprobado.');
+    if ((order as any).delivery_status === 'delivered') throw new Error('La lectura ya fue entregada.');
+    if ((order as any).attempts >= 5) throw new Error('Se alcanzó el límite de intentos. Requiere revisión administrativa.');
+    // Trigger delivery edge function
+    const result = await triggerDelivery(orderId);
+    // Re-fetch the updated order
+    const { data: updated, error: fetchErr } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', orderId)
+      .eq('user_id', session.user.id)
+      .maybeSingle();
+    if (fetchErr || !updated) throw new Error('No pudimos cargar el estado actualizado.');
+    return toOrder(updated as OrderRow);
+  }
+
+  // PDF download: authenticated fetch via edge function
+  if (path.includes('/pdf') && path.startsWith('orders/')) {
+    const orderId = path.split('/')[1];
+    return { pdfUrl: apiUrl(`order-pdf/${orderId}`) };
+  }
+
+  // Blocked: demo payments
+  if (path.startsWith('demo/')) {
     throw new Error('Las ventas públicas siguen desactivadas. Faltan conectar IA y entregas.');
   }
 

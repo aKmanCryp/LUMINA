@@ -1,0 +1,13 @@
+{
+  "projectId": "72346729",
+  "functions": {
+    "deliver-reading": {
+      "hasChanged": false,
+      "hash": "d1198e069319f8a853608d91e896b155f541e38e13aa4cfaaf2c16ac0a7fe9b7"
+    },
+    "order-pdf": {
+      "hasChanged": false,
+      "hash": "a8b99dc03c7bf5a298ac0b05d9cb0dc7649740606d420ac129303be1135818f2"
+    }
+  }
+}
