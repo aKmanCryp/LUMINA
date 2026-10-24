@@ -31,6 +31,41 @@ export type Order = {
   mode: string;
 };
 
+export type QrData = {
+  id: string;
+  slot: number;
+  product: string;
+  amount: number;
+  holder: string;
+  label: string;
+  image_data: string;
+  generated_at: string;
+  expires_at: string;
+};
+
+export type PaymentNotice = {
+  id: string;
+  order_id: string;
+  payer: string;
+  reference: string;
+  status: string;
+  reject_note: string | null;
+  created_at: string;
+  reviewed_at: string | null;
+  product: string;
+  amount: number;
+  mode: string;
+  user_email: string;
+};
+
+export type AdminDashboard = {
+  qr_codes: QrData[];
+  notices: PaymentNotice[];
+  orders: any[];
+  pending: number;
+  delivered: number;
+};
+
 function toOrder(row: OrderRow): Order {
   return {
     id: row.id,
@@ -45,6 +80,23 @@ function toOrder(row: OrderRow): Order {
     error: row.error,
     attempts: row.attempts,
     mode: row.mode,
+  };
+}
+
+function rpcToOrder(data: any): Order {
+  return {
+    id: data.id,
+    product: data.product as OrderInput['product'],
+    amount: data.amount,
+    discount: data.discount ?? 0,
+    payload: data.payload as unknown as OrderInput,
+    paymentStatus: data.payment_status,
+    deliveryStatus: data.delivery_status,
+    result: (data.result as Report) ?? null,
+    createdAt: data.created_at,
+    error: data.error ?? null,
+    attempts: data.attempts ?? 0,
+    mode: data.mode,
   };
 }
 
@@ -83,9 +135,6 @@ export async function signUp(email: string, password: string, displayName: strin
     options: { data: { display_name: displayName.trim() || undefined } },
   });
   if (error) throw new Error(translateAuthError(error.message));
-  // The database trigger create_profile_on_signup() creates the profile row
-  // automatically. If email confirmation is enabled, the user must confirm
-  // before they can sign in.
   if (data.user && data.session === null) {
     throw new Error('Te enviamos un correo de confirmación. Revisá tu bandeja antes de ingresar.');
   }
@@ -111,14 +160,21 @@ function translateAuthError(msg: string): string {
   return 'No pudimos completar la solicitud.';
 }
 
-export async function request(path: string, body?: unknown, key?: string): Promise<any> {
-  // Public endpoints that don't require auth
+function rpcError(error: { message: string }): Error {
+  const m = error.message;
+  if (m.includes('Solo un administrador')) return new Error('Necesitás permisos de administrador.');
+  if (m.includes('iniciar sesión')) return new Error('Necesitás iniciar sesión para continuar.');
+  return new Error(m);
+}
+
+export async function request(path: string, body?: unknown, _key?: string): Promise<any> {
+  // Public endpoints
   if (path === 'daily' && body === undefined) {
     const date = dateKey();
     return { date, items: SIGNS.map((s) => dailyFor(s.id, date)), mode: 'editorial-demo' };
   }
   if (path === 'payments/config' && body === undefined) {
-    return { mode: 'demo', contentReady: false, availableAmounts: [] };
+    return { mode: 'manual_qr', contentReady: false, availableAmounts: [] };
   }
   if (path === 'events') {
     return { ok: false, reason: 'backend_not_connected' };
@@ -132,6 +188,7 @@ export async function request(path: string, body?: unknown, key?: string): Promi
     return getMe();
   }
 
+  // List own orders
   if (path === 'orders' && body === undefined) {
     const { data, error } = await supabase
       .from('orders')
@@ -143,21 +200,17 @@ export async function request(path: string, body?: unknown, key?: string): Promi
     return { orders: (data as OrderRow[]).map(toOrder) };
   }
 
+  // Create order via server-side function
   if (path === 'orders' && body !== undefined) {
     const input = validateOrder(body);
-    const product = PRODUCTS.find((p) => p.id === input.product)!;
-    const { data, error } = await supabase
-      .from('orders')
-      .insert({
-        product: input.product,
-        payload: input as unknown as Record<string, unknown>,
-      })
-      .select('*')
-      .single();
-    if (error) throw new Error('No pudimos guardar tu pedido.');
-    return toOrder(data as OrderRow);
+    const { data, error } = await supabase.rpc('create_order', {
+      p_payload: input as unknown as Record<string, unknown>,
+    });
+    if (error) throw rpcError(error);
+    return rpcToOrder(data);
   }
 
+  // Get single order (ownership enforced by RLS)
   if (path.startsWith('orders/') && !path.includes('/', 'orders/'.length)) {
     const orderId = path.slice('orders/'.length);
     const { data, error } = await supabase
@@ -171,14 +224,139 @@ export async function request(path: string, body?: unknown, key?: string): Promi
     return toOrder(data as OrderRow);
   }
 
-  // Admin endpoints — still blocked in this phase (no payments/IA yet)
-  if (path.startsWith('admin/')) {
-    throw new Error('El panel de administración aún no está conectado. Faltan pagos e IA.');
+  // Get QR for order's product/amount
+  if (path.includes('/qr') && path.startsWith('orders/')) {
+    const orderId = path.split('/')[1];
+    // First get the order to know product and amount
+    const { data: order, error: orderErr } = await supabase
+      .from('orders')
+      .select('product, amount, payment_status')
+      .eq('id', orderId)
+      .eq('user_id', session.user.id)
+      .maybeSingle();
+    if (orderErr || !order) throw new Error('No se encontró este pedido o no tenés acceso.');
+    if ((order as any).payment_status !== 'pending') throw new Error('Este pedido ya no está pendiente de pago.');
+
+    const { data: qr, error: qrErr } = await supabase.rpc('get_qr_for_product', {
+      p_product: (order as any).product,
+      p_amount: (order as any).amount,
+    });
+    if (qrErr) throw rpcError(qrErr);
+    if (!qr) return { qr: null, message: 'No hay un QR vigente para este importe. Aguardá a que el administrador cargue uno.' };
+    return { qr, imageUrl: qr.image_data };
   }
 
-  // Demo payment / retry / PDF — blocked until backend is connected
-  if (path.startsWith('demo/') || path.includes('/retry') || path.includes('/pdf') || path.includes('/qr')) {
-    throw new Error('Migración a Bolt: faltan conectar pagos e IA. Las compras están desactivadas.');
+  // Submit payment notice ("Ya pagué")
+  if (path.includes('/payment-report') && path.startsWith('orders/') && body !== undefined) {
+    const orderId = path.split('/')[1];
+    const b = body as { payer: string; reference: string };
+    const { data, error } = await supabase.rpc('submit_payment_notice', {
+      p_order_id: orderId,
+      p_payer: b.payer,
+      p_reference: b.reference,
+    });
+    if (error) throw rpcError(error);
+    return data;
+  }
+
+  // Get payment notice status for an order
+  if (path.includes('/payment-report') && path.startsWith('orders/') && body === undefined) {
+    const orderId = path.split('/')[1];
+    const { data, error } = await supabase
+      .from('payment_notices')
+      .select('id, payer, reference, status, reject_note, created_at')
+      .eq('order_id', orderId)
+      .maybeSingle();
+    if (error) throw new Error('No pudimos cargar el aviso de pago.');
+    return { report: data };
+  }
+
+  // Admin: dashboard
+  if (path === 'admin/dashboard') {
+    const { data, error } = await supabase.rpc('admin_get_dashboard');
+    if (error) throw rpcError(error);
+    return {
+      qrCodes: (data as AdminDashboard).qr_codes,
+      notices: (data as AdminDashboard).notices,
+      orders: (data as AdminDashboard).orders,
+      pending: (data as AdminDashboard).pending,
+      delivered: (data as AdminDashboard).delivered,
+      todaySales: 0, todayRevenue: 0, monthRevenue: 0, netBeforeTax: 0,
+      monthGross: 0, refunds: 0, fees: 0, aiCost: 0, adSpend: 0, fixedCosts: 0,
+      vatReserve: 0, series: [], month: '', products: [], recurringCustomers: 0,
+      referrals: 0, discounts: 0, cac: null, errors: [],
+    };
+  }
+
+  // Admin: upload QR
+  if (path === 'admin/qr' && body !== undefined) {
+    const b = body as any;
+    const { data, error } = await supabase.rpc('admin_upload_qr', {
+      p_slot: b.slot,
+      p_product: b.product,
+      p_amount: b.amount,
+      p_holder: b.holder,
+      p_label: b.label,
+      p_image_data: b.image,
+      p_generated_at: b.generatedAt,
+      p_expires_at: b.expiresAt,
+    });
+    if (error) throw rpcError(error);
+    return data;
+  }
+
+  // Admin: list QR codes (via dashboard)
+  if (path === 'admin/qr' && body === undefined) {
+    const { data, error } = await supabase.rpc('admin_get_dashboard');
+    if (error) throw rpcError(error);
+    return { codes: (data as AdminDashboard).qr_codes, mode: 'manual_qr' };
+  }
+
+  // Admin: disable QR
+  if (path.match(/^admin\/qr\/\d+\/disable$/)) {
+    const slot = Number(path.split('/')[2]);
+    const { data, error } = await supabase.rpc('admin_disable_qr', { p_slot: slot });
+    if (error) throw rpcError(error);
+    return data;
+  }
+
+  // Admin: approve order
+  if (path.startsWith('admin/manual-payment/') && body !== undefined) {
+    const orderId = path.split('/')[2];
+    const b = body as { action: string; reference: string; amount: number };
+    if (b.action === 'approve') {
+      const { data, error } = await supabase.rpc('admin_approve_order', {
+        p_order_id: orderId,
+        p_reference: b.reference,
+        p_verified_amount: b.amount,
+      });
+      if (error) throw rpcError(error);
+      return data;
+    }
+    // reject
+    const { data, error } = await supabase.rpc('admin_reject_notice', {
+      p_order_id: orderId,
+      p_note: (b as any).note || 'No se encontró el ingreso.',
+    });
+    if (error) throw rpcError(error);
+    return data;
+  }
+
+  // Admin: list payment reports (via dashboard)
+  if (path === 'admin/payment-reports') {
+    const { data, error } = await supabase.rpc('admin_get_dashboard');
+    if (error) throw rpcError(error);
+    return { reports: (data as AdminDashboard).notices };
+  }
+
+  // Blocked: demo payments, retries, PDF, IA
+  if (path.startsWith('demo/') || path.includes('/retry') || path.includes('/pdf')) {
+    throw new Error('Las ventas públicas siguen desactivadas. Faltan conectar IA y entregas.');
+  }
+
+  // Blocked: admin expenses, refund, export
+  if (path.startsWith('admin/expenses') || path.startsWith('admin/refund') || path.startsWith('admin/export')) {
+    throw new Error('Esta función no está disponible en esta etapa.');
   }
 
   throw new Error('Operación no disponible en esta etapa.');
