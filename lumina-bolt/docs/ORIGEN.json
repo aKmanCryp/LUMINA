@@ -1,0 +1,7 @@
+{
+  "site_version": 5,
+  "source_commit": "7975b895cbd8963a80cf82545391449ddaecbc44",
+  "export_date": "2026-10-24",
+  "status": "frontend_portable_backend_migration_pending",
+  "contains_credentials": false
+}

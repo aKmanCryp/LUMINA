@@ -1,0 +1,12 @@
+Continuá LÚMINA a partir de ESTE repositorio existente. No generes otra web desde cero.
+
+Objetivo de esta etapa: ejecutar y revisar la interfaz importada, conservando diseño y comportamiento visual. Leé README.md, docs/ORIGEN.json y docs/CONTRATO_MIGRACION.md antes de cambiar archivos.
+
+1. Instalá dependencias y ejecutá npm run check y npm run build. La raíz ya es una SPA Vite/React/TypeScript; no requiere Cloudflare Workers, Vinext ni cabeceras de ChatGPT.
+2. Conservá fuentes en public/fonts, todos los colores, portada, muestra interactiva, animaciones, diseño de lectura marfil y producto principal Entre dos estrellas a ₲29.000. La lectura individual de ₲19.000 y el prototipo premium de ₲49.000 siguen disponibles en el diseño.
+3. Conservá los formatos DD/MM/AAAA y conversión ISO para el servidor, validación de edad adulta y autorización de la segunda persona.
+4. No inventes ventas, reseñas, lecturas reales, clientes, credenciales ni QR. src/lib/client.ts bloquea operaciones privadas hasta conectar el backend. Mantené ese bloqueo.
+5. Revisá portada, muestra, formulario, rutas SPA y estilos a 390 y 803 px. Leé reference/sites/app y reference/sites/lib solo si hace falta aclarar comportamiento; no reemplaces la app por ese runtime.
+6. No publiques ni actives cobros en esta etapa. Informá el resultado del build, qué se verificó y los pendientes para etapa 2.
+
+Al terminar, dejá la vista previa funcionando e indicá que corresponde continuar con docs/02_PROMPT_BACKEND.txt.
