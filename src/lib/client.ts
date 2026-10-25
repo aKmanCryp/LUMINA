@@ -66,6 +66,7 @@ export type AdminDashboard = {
   delivered: number;
   gen_errors?: number;
   ai_cost?: number;
+  settings?: Record<string, unknown>;
 };
 
 function toOrder(row: OrderRow): Order {
@@ -108,8 +109,8 @@ function referralCode(id: string): string {
   return (h >>> 0).toString(36).toUpperCase().padEnd(8, '0').slice(0, 8);
 }
 
-// Trigger the deliver-reading edge function to generate a reading.
-// Fire-and-forget: the edge function claims the lease and works asynchronously.
+// Call the deliver-reading edge function. The edge function verifies JWT
+// ownership or admin role, claims the lease exactly once, and generates.
 async function triggerDelivery(orderId: string): Promise<void> {
   const { data: { session } } = await supabase.auth.getSession();
   if (!session?.access_token) return;
@@ -124,7 +125,8 @@ async function triggerDelivery(orderId: string): Promise<void> {
     body: JSON.stringify({ order_id: orderId }),
   });
   if (!resp.ok) {
-    console.error('[lumina] deliver-reading responded', resp.status);
+    const body = await resp.json().catch(() => ({}));
+    console.error('[lumina] deliver-reading failed:', resp.status, body?.error);
   }
 }
 
@@ -236,6 +238,7 @@ const APP_ERROR_MARKERS = [
   'La imagen del QR no es válida',
   'La imagen del QR es demasiado grande',
   'No hay un QR',
+  'Las ventas están pausadas',
 ];
 
 function rpcError(error: { message: string }): Error {
@@ -363,11 +366,25 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
       delivered: (data as AdminDashboard).delivered,
       genErrors: (data as AdminDashboard).gen_errors || 0,
       aiCost: (data as AdminDashboard).ai_cost || 0,
+      settings: (data as AdminDashboard).settings || {},
       todaySales: 0, todayRevenue: 0, monthRevenue: 0, netBeforeTax: 0,
       monthGross: 0, refunds: 0, fees: 0, adSpend: 0, fixedCosts: 0,
       vatReserve: 0, series: [], month: '', products: [], recurringCustomers: 0,
       referrals: 0, discounts: 0, cac: null, errors: [],
     };
+  }
+
+  // Admin: get/set settings
+  if (path === 'admin/settings' && body === undefined) {
+    const { data, error } = await supabase.rpc('admin_get_settings');
+    if (error) throw rpcError(error);
+    return data;
+  }
+  if (path === 'admin/settings' && body !== undefined) {
+    const b = body as { key: string; value: any };
+    const { data, error } = await supabase.rpc('admin_set_setting', { p_key: b.key, p_value: b.value });
+    if (error) throw rpcError(error);
+    return data;
   }
 
   // Admin: upload QR
@@ -402,7 +419,7 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
     return data;
   }
 
-  // Admin: approve order (triggers generation via edge function)
+  // Admin: approve order — marks paid, then triggers generation synchronously
   if (path.startsWith('admin/manual-payment/') && body !== undefined) {
     const orderId = path.split('/')[2];
     const b = body as { action: string; reference: string; amount: number };
@@ -413,9 +430,12 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
         p_verified_amount: b.amount,
       });
       if (error) throw rpcError(error);
-      // If the RPC started a generation lease, trigger the edge function
-      if (data?.generate_order_id) {
-        triggerDelivery(data.generate_order_id).catch((e) => console.error('[lumina] delivery trigger failed:', e));
+      // Generation is triggered by calling the edge function, which claims
+      // the lease exactly once. No fire-and-forget: the admin sees the result.
+      if (data?.needs_generation) {
+        try { await triggerDelivery(orderId); } catch (e) {
+          console.error('[lumina] delivery failed after approval:', e);
+        }
       }
       return data;
     }
@@ -438,7 +458,7 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
   // Retry generation for a paid order that failed or is stuck
   if (path.includes('/retry') && path.startsWith('orders/') && body !== undefined) {
     const orderId = path.split('/')[1];
-    // Verify ownership and status
+    // Verify ownership and status via RLS
     const { data: order, error: orderErr } = await supabase
       .from('orders')
       .select('id, payment_status, delivery_status, attempts')
@@ -449,8 +469,8 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
     if ((order as any).payment_status !== 'paid') throw new Error('El pago no está aprobado.');
     if ((order as any).delivery_status === 'delivered') throw new Error('La lectura ya fue entregada.');
     if ((order as any).attempts >= 5) throw new Error('Se alcanzó el límite de intentos. Requiere revisión administrativa.');
-    // Trigger delivery edge function
-    const result = await triggerDelivery(orderId);
+    // Call the edge function — it claims the lease and generates
+    await triggerDelivery(orderId);
     // Re-fetch the updated order
     const { data: updated, error: fetchErr } = await supabase
       .from('orders')
