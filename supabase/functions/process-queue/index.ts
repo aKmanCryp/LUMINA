@@ -43,15 +43,17 @@ async function handleQueue(req: Request): Promise<Response> {
 
   const svc = createServiceClient();
 
+  const simMode = Deno.env.get("SIMULATION_MODE") === "true";
+
   // Check if generation is even possible before claiming work.
   // This avoids burning attempts on config/budget errors.
+  // In simulation mode, no API key is needed.
   const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) {
-    // Don't claim any orders — they'd just fail with AI_NOT_CONFIGURED.
+  if (!apiKey && !simMode) {
     return json({ ok: true, skipped: true, reason: "AI_NOT_CONFIGURED" });
   }
 
-  const model = Deno.env.get("OPENAI_MODEL") || "gpt-4o-mini";
+  const model = simMode ? "gpt-4o-mini" : (Deno.env.get("OPENAI_MODEL") || "gpt-4o-mini");
   const rates = MODEL_RATES[model];
   if (!rates) {
     return json({ ok: true, skipped: true, reason: "AI_UNKNOWN_MODEL" });
@@ -126,7 +128,9 @@ async function runGenerationWithClaim(
 
   let result;
   try {
-    result = await generateWithOpenAI(payload, product, claimed.id, apiKey, model, rates);
+    result = simMode
+      ? await simulateGeneration(payload, product, model, rates)
+      : await generateWithOpenAI(payload, product, claimed.id, apiKey!, model, rates);
   } catch (err) {
     const code = err instanceof Error && /^[A-Z_0-9]+$/.test(err.message) ? err.message : "GENERATION_REVIEW";
 
@@ -313,6 +317,33 @@ function validateReport(report: any, product: string): { ok: boolean; error?: st
   const text = JSON.stringify(report);
   if (/(?:vas a ganar|te vas a curar|volverá contigo|éxito garantizado|\d+\s*%|diagnóstico|invertí en)/i.test(text)) return { ok: false, error: "AI_CONTENT_REVIEW" };
   return { ok: true };
+}
+
+function simulateGeneration(
+  payload: Record<string, unknown>, product: string, model: string, rates: { input: number; output: number },
+): { report: any; source: string; costPyg: number; inputTokens: number; outputTokens: number; model: string } {
+  const signs = signForPayload(payload);
+  const alias = (payload.name as string) || "vos";
+  const alias2 = payload.name2 as string | undefined;
+  const sectionCount = product === "premium" ? 6 : product === "compatibilidad" ? 5 : 4;
+  const sections: { title: string; body: string; prompt: string }[] = [];
+  for (let i = 0; i < sectionCount; i++) {
+    sections.push({
+      title: `Sección ${i + 1} de prueba`,
+      body: `Esta es una sección de simulación para ${alias}${alias2 ? ` y ${alias2}` : ""}. El signo es ${signs.sign1}. Este contenido se genera sin llamadas pagas para verificar el pipeline completo de entrega. El cuerpo tiene suficiente longitud para pasar la validación de esquema y demostrar que el procesador automático funciona de extremo a extremo, desde el cron hasta la entrega final del pedido encolado.`,
+      prompt: `¿Qué te llama la atención de esta sección de prueba número ${i + 1}?`,
+    });
+  }
+  const report = {
+    title: `Lectura de simulación para ${alias}`,
+    intro: `Esta lectura fue generada en modo simulación para verificar el pipeline de entrega automática. No se realizaron llamadas pagas a OpenAI. El signo asociado es ${signs.sign1} y el producto es ${product}. Este texto introductorio tiene la longitud necesaria para pasar la validación de esquema del sistema de generación.`,
+    sections,
+    closing: `Cierre de la lectura de simulación. El procesador automático funcionó correctamente: el cron disparó la llamada, la función procesó el pedido y lo entregó sin intervención manual.`,
+  };
+  const inputTokens = 1000;
+  const outputTokens = 2000;
+  const costPyg = Math.round((inputTokens * rates.input + outputTokens * rates.output) / 1e6 * USD_PYG);
+  return { report, source: "simulation", costPyg, inputTokens, outputTokens, model };
 }
 
 function createServiceClient() {
