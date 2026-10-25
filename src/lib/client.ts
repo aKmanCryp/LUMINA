@@ -109,8 +109,10 @@ function referralCode(id: string): string {
   return (h >>> 0).toString(36).toUpperCase().padEnd(8, '0').slice(0, 8);
 }
 
-// Call the deliver-reading edge function. The edge function verifies JWT
-// ownership or admin role, claims the lease exactly once, and generates.
+// Call the deliver-reading edge function for a specific order or to poll the queue.
+// The work is already queued persistently in the database; this call tries to
+// process it. If the browser closes before this completes, the order stays
+// queued and any future call (retry, admin refresh, poll) will process it.
 async function triggerDelivery(orderId: string): Promise<void> {
   const { data: { session } } = await supabase.auth.getSession();
   if (!session?.access_token) return;
@@ -128,6 +130,24 @@ async function triggerDelivery(orderId: string): Promise<void> {
     const body = await resp.json().catch(() => ({}));
     console.error('[lumina] deliver-reading failed:', resp.status, body?.error);
   }
+}
+
+// Poll the generation queue. Tries to process the next queued order.
+// Called by the admin's browser after approval as a best-effort trigger.
+// If it fails or the browser closes, the order remains queued.
+async function pollDeliveryQueue(): Promise<void> {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session?.access_token) return;
+  const fnUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/deliver-reading`;
+  await fetch(fnUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${session.access_token}`,
+      apikey: import.meta.env.VITE_SUPABASE_ANON_KEY!,
+    },
+    body: JSON.stringify({ poll: true }),
+  }).catch(() => {});
 }
 
 // Download the PDF for a delivered order via authenticated fetch.
@@ -419,7 +439,7 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
     return data;
   }
 
-  // Admin: approve order — marks paid, then triggers generation synchronously
+  // Admin: approve order — enqueues generation persistently, then triggers a poll
   if (path.startsWith('admin/manual-payment/') && body !== undefined) {
     const orderId = path.split('/')[2];
     const b = body as { action: string; reference: string; amount: number };
@@ -430,12 +450,11 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
         p_verified_amount: b.amount,
       });
       if (error) throw rpcError(error);
-      // Generation is triggered by calling the edge function, which claims
-      // the lease exactly once. No fire-and-forget: the admin sees the result.
-      if (data?.needs_generation) {
-        try { await triggerDelivery(orderId); } catch (e) {
-          console.error('[lumina] delivery failed after approval:', e);
-        }
+      // The approval transaction already set delivery_status='queued'.
+      // This poll is a best-effort trigger: if the browser closes, the
+      // order stays queued and a future poll/retry will process it.
+      if (data?.queued) {
+        pollDeliveryQueue();
       }
       return data;
     }

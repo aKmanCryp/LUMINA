@@ -23,8 +23,21 @@ if (import.meta.main) {
   });
 }
 
+// Explicit model rate table. Unknown models are rejected.
+// Rates are USD per 1M tokens, as published by OpenAI.
+const MODEL_RATES: Record<string, { input: number; output: number }> = {
+  "gpt-4o-mini": { input: 0.15, output: 0.6 },
+  "gpt-4o": { input: 2.5, output: 10 },
+  "gpt-4.1-mini": { input: 0.4, output: 1.6 },
+  "gpt-4.1": { input: 2.0, output: 8 },
+  "gpt-4.1-nano": { input: 0.1, output: 0.4 },
+};
+
+const USD_PYG = 7500;
+const MAX_TOKENS: Record<string, number> = { premium: 5200, compatibilidad: 3800, lectura: 3800 };
+const ESTIMATED_INPUT_TOKENS = 600;
+
 async function handleDelivery(req: Request): Promise<Response> {
-  // 1. Verify JWT — only authenticated users (owner or admin) can trigger delivery
   const authHeader = req.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return json({ error: "Necesitás iniciar sesión." }, 401);
@@ -33,35 +46,37 @@ async function handleDelivery(req: Request): Promise<Response> {
 
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
-  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-  // User client to verify ownership/admin via RLS
   const userClient = createClient(supabaseUrl, anonKey, {
     auth: { persistSession: false },
     global: { headers: { Authorization: `Bearer ${token}` } },
   });
 
+  const svc = createServiceClient();
+
+  // Poll mode: process the next queued order (no order_id needed)
   const body = await req.json().catch(() => ({}));
+  if (body.poll === true) {
+    return await runPoll(svc);
+  }
+
   const orderId = body.order_id;
   if (!orderId || typeof orderId !== "string") {
     return json({ error: "Falta el identificador del pedido." }, 400);
   }
 
-  // Verify the caller owns this order or is admin (RLS enforces ownership on SELECT)
+  // Verify the caller owns this order or is admin
   const { data: order, error: orderErr } = await userClient
     .from("orders")
     .select("id, user_id, payment_status, delivery_status, attempts")
     .eq("id", orderId)
     .maybeSingle();
 
-  // If not found via RLS, check if the caller is admin
   if (orderErr || !order) {
     const { data: adminCheck } = await userClient.rpc("is_admin");
     if (!adminCheck) {
       return json({ error: "No tenés acceso a este pedido." }, 403);
     }
-    // Admin is calling — re-fetch via service client
-    const svc = createServiceClient();
     const { data: adminOrder } = await svc
       .from("orders")
       .select("id, payment_status, delivery_status, attempts")
@@ -73,7 +88,6 @@ async function handleDelivery(req: Request): Promise<Response> {
     return await runGeneration(svc, orderId);
   }
 
-  // Owner is calling — verify it's paid and needs generation
   if (order.payment_status !== "paid") {
     return json({ error: "El pago no está aprobado." }, 409);
   }
@@ -84,28 +98,46 @@ async function handleDelivery(req: Request): Promise<Response> {
     return json({ error: "Se alcanzó el límite de intentos." }, 429);
   }
 
-  return await runGeneration(createServiceClient(), orderId);
+  return await runGeneration(svc, orderId);
 }
 
-async function runGeneration(svc: ReturnType<typeof createServiceClient>, orderId: string): Promise<Response> {
-  // 2. Atomically claim the generation lease — returns a unique lease_token
+// Poll mode: claim the oldest queued order and process it.
+// This is called by the admin's browser after approval, by retry, or by
+// any future external trigger. Closing the browser after approval leaves
+// the order queued; a subsequent poll will process it.
+async function runPoll(svc: ReturnType<typeof createClient>): Promise<Response> {
+  const { data: claimed, error } = await svc.rpc("claim_next_queued_order");
+  if (error) return json({ error: "No se pudo procesar la cola." }, 500);
+  if (!claimed) {
+    return json({ ok: true, message: "No hay pedidos pendientes de generación.", skipped: true });
+  }
+  // Process this order
+  return await runGenerationWithClaim(svc, claimed);
+}
+
+async function runGeneration(svc: ReturnType<typeof createClient>, orderId: string): Promise<Response> {
+  // Claim the lease
   const { data: claimed, error: claimErr } = await svc.rpc("claim_generation_lease", { p_order_id: orderId });
   if (claimErr) return json({ error: "No se pudo iniciar la generación." }, 500);
   if (!claimed) {
     return json({ ok: true, message: "El pedido ya fue entregado o no requiere generación.", skipped: true });
   }
+  return await runGenerationWithClaim(svc, claimed);
+}
 
+async function runGenerationWithClaim(
+  svc: ReturnType<typeof createClient>,
+  claimed: any,
+): Promise<Response> {
   const leaseToken = claimed.lease_token as string;
   const payload = claimed.payload as Record<string, unknown>;
   const product = claimed.product as string;
 
-  // 3. Check API key — NO demo fallback for real orders
+  // Check API key — NO demo fallback
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!apiKey) {
-    // Without the key, the payment stays approved but delivery stays pending.
-    // The user can retry once the key is configured.
     await svc.rpc("fail_generation", {
-      p_order_id: orderId,
+      p_order_id: claimed.id,
       p_lease_token: leaseToken,
       p_error_code: "AI_NOT_CONFIGURED",
     });
@@ -113,36 +145,74 @@ async function runGeneration(svc: ReturnType<typeof createServiceClient>, orderI
   }
 
   const model = Deno.env.get("OPENAI_MODEL") || "gpt-4o-mini";
+  const rates = MODEL_RATES[model];
+  if (!rates) {
+    await svc.rpc("fail_generation", {
+      p_order_id: claimed.id,
+      p_lease_token: leaseToken,
+      p_error_code: "AI_UNKNOWN_MODEL",
+    });
+    return json({ ok: false, error: `El modelo ${model} no tiene tarifas configuradas.` }, 400);
+  }
 
-  // 4. Estimate cost and atomically reserve budget
-  // Conservative estimate: ~500 input tokens, ~2000 output tokens for compatibilidad
-  const estInputTokens = 500;
-  const estOutputTokens = product === "premium" ? 3000 : 2000;
-  const inputPricePerM = model.includes("gpt-4o-mini") ? 0.15 : 0.6;
-  const outputPricePerM = model.includes("gpt-4o-mini") ? 0.6 : 2.4;
-  const usdPyg = 7500;
-  const estCostPyg = Math.ceil((estInputTokens * inputPricePerM + estOutputTokens * outputPricePerM) / 1e6 * usdPyg);
+  // Reserve budget based on MAX possible cost: max_tokens output + estimated input
+  const maxOutputTokens = MAX_TOKENS[product] || 3800;
+  const maxCostPyg = Math.ceil(
+    (ESTIMATED_INPUT_TOKENS * rates.input + maxOutputTokens * rates.output) / 1e6 * USD_PYG,
+  );
 
-  const { data: reserved } = await svc.rpc("reserve_budget", { p_cost_pyg: estCostPyg });
+  const { data: reserved } = await svc.rpc("reserve_budget", { p_cost_pyg: maxCostPyg });
   if (!reserved) {
     await svc.rpc("fail_generation", {
-      p_order_id: orderId,
+      p_order_id: claimed.id,
       p_lease_token: leaseToken,
       p_error_code: "AI_BUDGET_EXCEEDED",
     });
     return json({ ok: false, error: "Se alcanzó el límite de gasto de IA configurado." }, 429);
   }
 
-  // 5. Call OpenAI
+  // Record the reservation in budget_reconciliation for idempotent reconciliation
+  await svc.from("budget_reconciliation").insert({
+    order_id: claimed.id,
+    lease_token: leaseToken,
+    reserved_pyg: maxCostPyg,
+  });
+
+  // Call OpenAI
   let result;
   try {
-    result = await generateWithOpenAI(payload, product, orderId, apiKey, model, usdPyg, inputPricePerM, outputPricePerM);
+    result = await generateWithOpenAI(payload, product, claimed.id, apiKey, model, rates);
   } catch (err) {
     const code = err instanceof Error && /^[A-Z_0-9]+$/.test(err.message) ? err.message : "GENERATION_REVIEW";
-    // Release the reserved budget since the call failed
-    await svc.rpc("release_budget", { p_cost_pyg: estCostPyg });
+
+    if (code === "AI_TIMEOUT") {
+      // Timeout: consumption is uncertain. Leave the reservation pending.
+      // record_consumption can be called later when usage data arrives.
+      // For now, fail the generation but DON'T release the budget.
+      await svc.rpc("fail_generation", {
+        p_order_id: claimed.id,
+        p_lease_token: leaseToken,
+        p_error_code: "AI_TIMEOUT",
+        p_tokens_used: 0,
+      });
+      return json({ ok: false, error: "La generación tardó demasiado. El presupuesto queda pendiente de conciliación." }, 504);
+    }
+
+    // Non-timeout error (HTTP error, parse error): the call may have consumed
+    // tokens. Record 0 consumption (releases full reserve) only for errors
+    // that definitely didn't consume tokens (HTTP 4xx before API call).
+    // For HTTP 5xx or parse errors, tokens may have been consumed.
+    if (code.startsWith("AI_HTTP_4")) {
+      // 4xx: request rejected by OpenAI, no tokens consumed
+      await svc.rpc("record_consumption", {
+        p_order_id: claimed.id,
+        p_lease_token: leaseToken,
+        p_actual_cost_pyg: 0,
+      });
+    }
+    // For 5xx and other errors: leave reservation pending (consumption uncertain)
     await svc.rpc("fail_generation", {
-      p_order_id: orderId,
+      p_order_id: claimed.id,
       p_lease_token: leaseToken,
       p_error_code: code,
       p_tokens_used: 0,
@@ -150,27 +220,29 @@ async function runGeneration(svc: ReturnType<typeof createServiceClient>, orderI
     return json({ ok: false, error: "La generación con IA falló. El pago sigue aprobado y podés reintentar." }, 502);
   }
 
-  // 6. Validate structure
+  // Record actual consumption BEFORE validation and storage.
+  // This is idempotent: calling twice does not double-release.
+  const actualCost = result.costPyg;
+  await svc.rpc("record_consumption", {
+    p_order_id: claimed.id,
+    p_lease_token: leaseToken,
+    p_actual_cost_pyg: actualCost,
+  });
+
+  // Validate structure. If it fails, the cost was already consumed — don't release.
   const validation = validateReport(result.report, product);
   if (!validation.ok) {
-    await svc.rpc("release_budget", { p_cost_pyg: estCostPyg });
     await svc.rpc("fail_generation", {
-      p_order_id: orderId,
+      p_order_id: claimed.id,
       p_lease_token: leaseToken,
       p_error_code: validation.error || "AI_SCHEMA_INVALID",
     });
     return json({ ok: false, error: "La estructura del contenido no es válida." }, 422);
   }
 
-  // 7. Adjust budget: if actual cost differs from estimate, reconcile
-  const actualCost = result.costPyg;
-  if (actualCost < estCostPyg) {
-    await svc.rpc("release_budget", { p_cost_pyg: estCostPyg - actualCost });
-  }
-
-  // 8. Store result — must present the lease_token
+  // Store result — must present the lease_token
   const { data: completeResult, error: completeErr } = await svc.rpc("complete_generation", {
-    p_order_id: orderId,
+    p_order_id: claimed.id,
     p_lease_token: leaseToken,
     p_result: result.report,
     p_source: result.source,
@@ -181,20 +253,17 @@ async function runGeneration(svc: ReturnType<typeof createServiceClient>, orderI
   });
 
   if (completeErr) {
-    // The RPC itself errored — release budget and fail
-    await svc.rpc("release_budget", { p_cost_pyg: actualCost });
+    // Store failed, but consumption was already recorded. Don't release budget.
     await svc.rpc("fail_generation", {
-      p_order_id: orderId,
+      p_order_id: claimed.id,
       p_lease_token: leaseToken,
       p_error_code: "STORE_FAILED",
     });
     return json({ ok: false, error: "No se pudo guardar la lectura." }, 500);
   }
 
-  // Check the ok field in the returned JSON
   if (!completeResult?.ok) {
-    // Lease expired or token mismatch — a newer worker may have taken over
-    // Budget was consumed by this attempt but the result wasn't stored
+    // Lease expired or token mismatch. Consumption was recorded; budget is correct.
     console.error("[deliver-reading] complete_generation returned ok=false:", completeResult?.message);
     return json({ ok: false, error: "El lease expiró. Reintentá la generación." }, 409);
   }
@@ -215,14 +284,8 @@ function buildUserPrompt(payload: Record<string, unknown>, product: string, vari
 
   if (product === "compatibilidad") {
     return JSON.stringify({
-      product,
-      alias,
-      sign: signs.sign1,
-      alias2,
-      sign2: signs.sign2,
-      theme,
-      sections: sectionCount,
-      variant,
+      product, alias, sign: signs.sign1, alias2, sign2: signs.sign2, theme,
+      sections: sectionCount, variant,
       instructions: `Generá exactamente ${sectionCount} secciones para una lectura de pareja:
 1. "Sus dos universos" — describe el mundo simbólico de cada persona con su signo, rasgo y elemento.
 2. "Lo que los acerca" — afinidades y complementos entre sus signos.
@@ -234,12 +297,7 @@ Usá el voseo paraguayo. Incluí ejemplos específicos referidos a ambos alias.`
   }
 
   return JSON.stringify({
-    product,
-    alias,
-    sign: signs.sign1,
-    theme,
-    sections: sectionCount,
-    variant,
+    product, alias, sign: signs.sign1, theme, sections: sectionCount, variant,
     instructions: `Generá exactamente ${sectionCount} secciones para una lectura individual sobre ${theme}.`,
   });
 }
@@ -286,9 +344,7 @@ async function generateWithOpenAI(
   orderId: string,
   apiKey: string,
   model: string,
-  usdPyg: number,
-  inputPricePerM: number,
-  outputPricePerM: number,
+  rates: { input: number; output: number },
 ): Promise<{ report: any; source: string; costPyg: number; inputTokens: number; outputTokens: number; model: string }> {
   const userPrompt = buildUserPrompt(payload, product, orderId.slice(-6));
 
@@ -301,11 +357,7 @@ async function generateWithOpenAI(
         type: "array",
         items: {
           type: "object",
-          properties: {
-            title: { type: "string" },
-            body: { type: "string" },
-            prompt: { type: "string" },
-          },
+          properties: { title: { type: "string" }, body: { type: "string" }, prompt: { type: "string" } },
           required: ["title", "body", "prompt"],
           additionalProperties: false,
         },
@@ -316,26 +368,29 @@ async function generateWithOpenAI(
     additionalProperties: false,
   };
 
-  const maxTokens = product === "premium" ? 5200 : 3800;
+  const maxTokens = MAX_TOKENS[product] || 3800;
 
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: userPrompt },
-      ],
-      response_format: { type: "json_schema", json_schema: { name: "astral_reading", strict: true, schema } },
-      max_tokens: maxTokens,
-      temperature: 0.8,
-    }),
-    signal: AbortSignal.timeout(45000),
-  });
+  let response: Response;
+  try {
+    response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userPrompt },
+        ],
+        response_format: { type: "json_schema", json_schema: { name: "astral_reading", strict: true, schema } },
+        max_tokens: maxTokens,
+        temperature: 0.8,
+      }),
+      signal: AbortSignal.timeout(45000),
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "TimeoutError") throw new Error("AI_TIMEOUT");
+    throw new Error("AI_FETCH_ERROR");
+  }
 
   if (!response.ok) {
     const errText = await response.text().catch(() => "");
@@ -350,7 +405,7 @@ async function generateWithOpenAI(
   const parsed = JSON.parse(content);
   const inputTokens = r.usage?.prompt_tokens || 0;
   const outputTokens = r.usage?.completion_tokens || 0;
-  const costPyg = Math.round((inputTokens * inputPricePerM + outputTokens * outputPricePerM) / 1e6 * usdPyg);
+  const costPyg = Math.round((inputTokens * rates.input + outputTokens * rates.output) / 1e6 * USD_PYG);
 
   return { report: parsed, source: "openai", costPyg, inputTokens, outputTokens, model };
 }
