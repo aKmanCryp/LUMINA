@@ -43,17 +43,16 @@ async function handleQueue(req: Request): Promise<Response> {
 
   const svc = createServiceClient();
 
-  const simMode = Deno.env.get("SIMULATION_MODE") === "true";
-
   // Check if generation is even possible before claiming work.
   // This avoids burning attempts on config/budget errors.
-  // In simulation mode, no API key is needed.
+  // In simulation mode with test orders, no API key is needed.
+  const simMode = Deno.env.get("SIMULATION_MODE") === "true";
   const apiKey = Deno.env.get("OPENAI_API_KEY");
   if (!apiKey && !simMode) {
     return json({ ok: true, skipped: true, reason: "AI_NOT_CONFIGURED" });
   }
 
-  const model = simMode ? "gpt-4o-mini" : (Deno.env.get("OPENAI_MODEL") || "gpt-4o-mini");
+  const model = Deno.env.get("OPENAI_MODEL") || "gpt-4o-mini";
   const rates = MODEL_RATES[model];
   if (!rates) {
     return json({ ok: true, skipped: true, reason: "AI_UNKNOWN_MODEL" });
@@ -74,7 +73,11 @@ async function handleQueue(req: Request): Promise<Response> {
   }
 
   // Process it — reuse the same generation logic as deliver-reading
-  return await runGenerationWithClaim(svc, claimed, apiKey, model, rates);
+  const simMode = Deno.env.get("SIMULATION_MODE") === "true";
+  const isTestOrder = claimed.mode === "test";
+  const useSimulation = simMode && isTestOrder;
+
+  return await runGenerationWithClaim(svc, claimed, apiKey, model, rates, useSimulation);
 }
 
 // --- Generation logic (shared with deliver-reading) ---
@@ -99,6 +102,7 @@ async function runGenerationWithClaim(
   apiKey: string,
   model: string,
   rates: { input: number; output: number },
+  useSimulation: boolean,
 ): Promise<Response> {
   const leaseToken = claimed.lease_token as string;
   const payload = claimed.payload as Record<string, unknown>;
@@ -128,9 +132,9 @@ async function runGenerationWithClaim(
 
   let result;
   try {
-    result = simMode
+    result = useSimulation
       ? await simulateGeneration(payload, product, model, rates)
-      : await generateWithOpenAI(payload, product, claimed.id, apiKey!, model, rates);
+      : await generateWithOpenAI(payload, product, claimed.id, apiKey, model, rates);
   } catch (err) {
     const code = err instanceof Error && /^[A-Z_0-9]+$/.test(err.message) ? err.message : "GENERATION_REVIEW";
 
