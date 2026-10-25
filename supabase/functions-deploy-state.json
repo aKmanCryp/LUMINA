@@ -3,11 +3,15 @@
   "functions": {
     "deliver-reading": {
       "hasChanged": false,
-      "hash": "228fd5c688d965f4528c9e074fb88839a8d0afb71c8a4aa9ca892daca4cd79f5"
+      "hash": "56abe9978e9c8e18af58ac4244cbef5d89db0455aa69dae580b59ec62d71e896"
     },
     "order-pdf": {
       "hasChanged": false,
       "hash": "a8b99dc03c7bf5a298ac0b05d9cb0dc7649740606d420ac129303be1135818f2"
+    },
+    "process-queue": {
+      "hasChanged": false,
+      "hash": "f043b532ef6da240340e1267afce9ec359686eb73935db21b79ea68bda11efe9"
     }
   }
 }

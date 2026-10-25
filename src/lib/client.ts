@@ -67,6 +67,9 @@ export type AdminDashboard = {
   gen_errors?: number;
   ai_cost?: number;
   settings?: Record<string, unknown>;
+  pending_reservations?: number;
+  overspend_pyg?: number;
+  budget_remaining?: number;
 };
 
 function toOrder(row: OrderRow): Order {
@@ -387,6 +390,9 @@ export async function request(path: string, body?: unknown, _key?: string): Prom
       genErrors: (data as AdminDashboard).gen_errors || 0,
       aiCost: (data as AdminDashboard).ai_cost || 0,
       settings: (data as AdminDashboard).settings || {},
+      pendingReservations: (data as AdminDashboard).pending_reservations || 0,
+      overspendPyg: (data as AdminDashboard).overspend_pyg || 0,
+      budgetRemaining: (data as AdminDashboard).budget_remaining || 0,
       todaySales: 0, todayRevenue: 0, monthRevenue: 0, netBeforeTax: 0,
       monthGross: 0, refunds: 0, fees: 0, adSpend: 0, fixedCosts: 0,
       vatReserve: 0, series: [], month: '', products: [], recurringCustomers: 0,

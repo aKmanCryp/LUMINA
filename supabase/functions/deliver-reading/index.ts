@@ -35,7 +35,9 @@ const MODEL_RATES: Record<string, { input: number; output: number }> = {
 
 const USD_PYG = 7500;
 const MAX_TOKENS: Record<string, number> = { premium: 5200, compatibilidad: 3800, lectura: 3800 };
-const ESTIMATED_INPUT_TOKENS = 600;
+// Conservative input estimate: system prompt (~250 tokens) + user prompt with
+// schema + payload data (~500 tokens) + JSON schema overhead (~100 tokens)
+const ESTIMATED_INPUT_TOKENS = 1200;
 
 async function handleDelivery(req: Request): Promise<Response> {
   const authHeader = req.headers.get("Authorization");

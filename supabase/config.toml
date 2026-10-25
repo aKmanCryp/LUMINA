@@ -5,3 +5,7 @@ entrypoint = "./functions/deliver-reading/index.ts"
 [functions.order-pdf]
 verify_jwt = true
 entrypoint = "./functions/order-pdf/index.ts"
+
+[functions.process-queue]
+verify_jwt = false
+entrypoint = "./functions/process-queue/index.ts"
