@@ -262,6 +262,8 @@ const APP_ERROR_MARKERS = [
   'La imagen del QR es demasiado grande',
   'No hay un QR',
   'Las ventas están pausadas',
+  'El estado de ventas debe ser',
+  'El presupuesto de IA debe ser',
 ];
 
 function rpcError(error: { message: string }): Error {
