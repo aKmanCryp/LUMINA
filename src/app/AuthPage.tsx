@@ -76,11 +76,9 @@ export function AuthPage({ onAuthed }: { onAuthed: () => void }) {
               type="password"
               name="password"
               required
-              minLength={6}
-              pattern={mode === 'signup' ? '[A-Za-z0-9]{6,}' : undefined}
-              title={mode === 'signup' ? 'Mínimo 6 letras o números, sin símbolos' : undefined}
+              minLength={mode === 'signup' ? 8 : undefined}
               autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-              placeholder={mode === 'signup' ? 'Mínimo 6 letras o números' : 'Tu contraseña'}
+              placeholder={mode === 'signup' ? 'Mínimo 8 caracteres' : 'Tu contraseña'}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
             />

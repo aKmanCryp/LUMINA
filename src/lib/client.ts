@@ -1,6 +1,8 @@
 import { supabase, type Profile, type OrderRow } from './supabase';
 import { dailyFor, dateKey, SIGNS, PRODUCTS, validateOrder, type OrderInput, type Report } from './domain';
 
+const MIN_PASSWORD_LENGTH = 8;
+
 export const money = (v: number) => '₲' + new Intl.NumberFormat('es-PY', { maximumFractionDigits: 0 }).format(v);
 
 export function apiUrl(path: string) {
@@ -195,15 +197,15 @@ export async function getMe(): Promise<Me | null> {
 }
 
 export async function signUp(email: string, password: string, displayName: string): Promise<void> {
-  if (!/^[A-Za-z0-9]{6,}$/.test(password)) {
-    throw new Error('La contraseña debe tener al menos 6 letras o números, sin símbolos.');
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    throw new Error(`La contraseña debe tener al menos ${MIN_PASSWORD_LENGTH} caracteres.`);
   }
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
     options: { data: { display_name: displayName.trim() || undefined } },
   });
-  if (error) throw new Error(translateAuthError(error.message));
+  if (error) throw new Error(translateAuthError(error));
   if (data.user && data.session === null) {
     throw new Error('Te enviamos un correo de confirmación. Revisá tu bandeja antes de ingresar.');
   }
@@ -211,27 +213,32 @@ export async function signUp(email: string, password: string, displayName: strin
 
 export async function signIn(email: string, password: string): Promise<void> {
   const { error } = await supabase.auth.signInWithPassword({ email, password });
-  if (error) throw new Error(translateAuthError(error.message));
+  if (error) throw new Error(translateAuthError(error));
 }
 
 export async function signOut(): Promise<void> {
   await supabase.auth.signOut();
 }
 
-function translateAuthError(msg: string): string {
-  const m = msg.toLowerCase();
-  if (m.includes('invalid login')) return 'Correo o contraseña incorrectos.';
-  if (m.includes('already registered') || m.includes('already been registered'))
-    // Neutral wording on purpose: confirming that an address has an account would let
-    // anyone test a list of emails through this form and build a customer list.
-    return 'No pudimos crear la cuenta con esos datos. Si ya tenés una cuenta, ingresá desde el formulario de inicio de sesión o recuperá tu contraseña.';
-  if (m.includes('at least 6')) return 'La contraseña debe tener al menos 6 caracteres.';
-  if (m.includes('weak') || m.includes('should contain') || m.includes('known to be'))
-    return 'Esa contraseña es muy común o no cumple los requisitos. Probá con una combinación de letras y números.';
-  if (m.includes('password')) return 'La contraseña no es válida. Probá con otra.';
-  if (m.includes('email')) return 'Ingresá un correo válido.';
-  if (m.includes('rate limit')) return 'Demasiados intentos. Aguardá un momento.';
-  return 'No pudimos completar la solicitud.';
+function translateAuthError(error: { code?: string }): string {
+  switch (error.code) {
+    case 'invalid_credentials':
+      return 'Correo o contraseña incorrectos.';
+    case 'weak_password':
+      return `La contraseña no cumple los requisitos: debe tener al menos ${MIN_PASSWORD_LENGTH} caracteres y no puede ser una clave muy común.`;
+    case 'user_already_exists':
+    case 'email_exists':
+      // Neutral wording on purpose: confirming that an address has an account would let
+      // anyone test a list of emails through this form and build a customer list.
+      return 'No pudimos crear la cuenta con esos datos. Si ya tenés una cuenta, ingresá desde el formulario de inicio de sesión o recuperá tu contraseña.';
+    case 'email_address_invalid':
+      return 'Ingresá un correo válido.';
+    case 'over_request_rate_limit':
+    case 'over_email_send_rate_limit':
+      return 'Demasiados intentos. Aguardá un momento.';
+    default:
+      return 'No pudimos completar la solicitud. Intentá de nuevo.';
+  }
 }
 
 // The database raises its own Spanish, user-facing messages for every rule the app
