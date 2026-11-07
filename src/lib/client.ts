@@ -195,6 +195,9 @@ export async function getMe(): Promise<Me | null> {
 }
 
 export async function signUp(email: string, password: string, displayName: string): Promise<void> {
+  if (!/^[A-Za-z0-9]{6,}$/.test(password)) {
+    throw new Error('La contraseña debe tener al menos 6 letras o números, sin símbolos.');
+  }
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
