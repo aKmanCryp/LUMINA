@@ -222,7 +222,10 @@ function translateAuthError(msg: string): string {
     // Neutral wording on purpose: confirming that an address has an account would let
     // anyone test a list of emails through this form and build a customer list.
     return 'No pudimos crear la cuenta con esos datos. Si ya tenés una cuenta, ingresá desde el formulario de inicio de sesión o recuperá tu contraseña.';
-  if (m.includes('password')) return 'La contraseña debe tener al menos 6 caracteres.';
+  if (m.includes('at least 6')) return 'La contraseña debe tener al menos 6 caracteres.';
+  if (m.includes('weak') || m.includes('should contain') || m.includes('known to be'))
+    return 'Esa contraseña es muy común o no cumple los requisitos. Probá con una combinación de letras y números.';
+  if (m.includes('password')) return 'La contraseña no es válida. Probá con otra.';
   if (m.includes('email')) return 'Ingresá un correo válido.';
   if (m.includes('rate limit')) return 'Demasiados intentos. Aguardá un momento.';
   return 'No pudimos completar la solicitud.';
